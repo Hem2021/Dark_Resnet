@@ -21,6 +21,21 @@ import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Subset
 
+class DarkLightDataset(torch.utils.data.Dataset):
+    def __init__(self, root, transform, gamma=2.2):
+        self.dataset = datasets.ImageFolder(root, transform=transform)
+        self.gamma = gamma
+
+    def __getitem__(self, index):
+        # Get the light image
+        light_image, label = self.dataset[index]
+        # Convert the light image to dark image using gamma transformation
+        dark_image = light_image ** self.gamma
+        return dark_image, light_image, label
+
+    def __len__(self):
+        return len(self.dataset)
+
 model_names = sorted(
     name
     for name in models.__dict__
@@ -65,7 +80,7 @@ parser.add_argument(
     "-b",
     "--batch-size",
     # default=256,
-    default=32,
+    default=64,
     type=int,
     metavar="N",
     help="mini-batch size (default: 256), this is the total "
@@ -75,7 +90,7 @@ parser.add_argument(
 parser.add_argument(
     "--lr",
     "--learning-rate",
-    default=0.1,
+    default=0.005,
     type=float,
     metavar="LR",
     help="initial learning rate",
@@ -219,78 +234,10 @@ def main_worker(gpu, ngpus_per_node, args):
             world_size=args.world_size,
             rank=args.rank,
         )
+    
     # create model
     # hem
-    class CNNBlock(nn.Module):
-        def __init__(self,
-                    in_channels,
-                    out_channels,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1):
-            super(CNNBlock, self).__init__()
 
-            self.seq_block = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False),
-                nn.BatchNorm2d(out_channels),
-                nn.LeakyReLU(negative_slope=0.3, inplace=True)  # Use LeakyReLU for negative_slope  # slope = 0.3 to match default value with keras
-            )
-
-        def forward(self, x):
-            x = self.seq_block(x)
-            return x
-        
-
-    class Encoder(torch.nn.Module):
-        def __init__(self, args):
-            super(Encoder, self).__init__()
-
-            # self.resnet = resnet18(pretrained=True)
-
-            if args.pretrained:
-                print("=> using pre-trained model '{}'".format(args.arch))
-                self.resnet = models.__dict__[args.arch](pretrained=True)
-            else:                
-                print("=> creating encoder '{}'".format(args.arch))
-                self.resnet = models.__dict__[args.arch]()
-
-        def forward(self, x):
-            intermediate_outputs = {}
-            route_connection = []
-            x = self.resnet.conv1(x)
-            intermediate_outputs["conv1"] = x
-            x = self.resnet.bn1(x)
-            intermediate_outputs["bn1"] = x
-            x = self.resnet.relu(x)
-            intermediate_outputs["layer0_relu"] = x
-            x = self.resnet.maxpool(x)
-            intermediate_outputs["maxpool"] = x
-
-            # Layer-wise intermediate_outputs
-            x = self.resnet.layer1(x)
-            intermediate_outputs["layer1"] = x
-            x = self.resnet.layer2(x)
-            intermediate_outputs["layer2"] = x
-            x = self.resnet.layer3(x)
-            intermediate_outputs["layer3"] = x
-            x = self.resnet.layer4(x)
-            intermediate_outputs["layer4"] = x
-
-            # Add avgpool and fc for classification
-            x = self.resnet.avgpool(x)
-            x = torch.flatten(x, 1)  # Flatten before the fully connected layer
-            intermediate_outputs["avgpool"] = x
-            x = self.resnet.fc(x)
-            intermediate_outputs["fc"] = x
-
-
-            route_connection.append(intermediate_outputs["layer0_relu"])
-            route_connection.append(intermediate_outputs["layer1"])
-            route_connection.append(intermediate_outputs["layer2"])
-            route_connection.append(intermediate_outputs["layer3"])
-            route_connection.append(intermediate_outputs["layer4"])
-
-    # hem
     class CNNBlock(nn.Module):
         def __init__(self,
                     in_channels,
@@ -329,15 +276,15 @@ def main_worker(gpu, ngpus_per_node, args):
             intermediate_outputs = {}
             route_connection = []
 
-
-            print("\nENCODER INPUT Image Stats:")
-            print(f"{'Layer':<20} {'Shape':<30} {'Min':<15} {'Max':<15} {'Mean':<15} {'Std Dev':<15}")
-            print("-" * 110)
-            print(f"{'layer4':<20} {str(x.shape):<30} "
-                  f"{x.min().item():<15.6f} "
-                  f"{x.max().item():<15.6f} "
-                  f"{x.mean().item():<15.6f} "
-                  f"{x.std().item():<15.6f}")
+            # uncomment to see the input image stats
+            # print("\nENCODER INPUT Image Stats:")
+            # print(f"{'Layer':<20} {'Shape':<30} {'Min':<15} {'Max':<15} {'Mean':<15} {'Std Dev':<15}")
+            # print("-" * 110)
+            # print(f"{'layer4':<20} {str(x.shape):<30} "
+            #       f"{x.min().item():<15.6f} "
+            #       f"{x.max().item():<15.6f} "
+            #       f"{x.mean().item():<15.6f} "
+            #       f"{x.std().item():<15.6f}")
             
             x = self.resnet.conv1(x)
             intermediate_outputs["conv1"] = x
@@ -364,6 +311,7 @@ def main_worker(gpu, ngpus_per_node, args):
             intermediate_outputs["avgpool"] = x
             x = self.resnet.fc(x)
             intermediate_outputs["fc"] = x
+            # intermediate_outputs["fc"] = torch.randn(32, 1000).to('mps')
 
 
             route_connection.append(intermediate_outputs["layer0_relu"])
@@ -372,15 +320,16 @@ def main_worker(gpu, ngpus_per_node, args):
             route_connection.append(intermediate_outputs["layer3"])
             route_connection.append(intermediate_outputs["layer4"])
 
+            # uncomment to see the encoder output image stats
 
-            print("\nENCODER FINAL Image Stats:")
-            print(f"{'Layer':<20} {'Shape':<30} {'Min':<15} {'Max':<15} {'Mean':<15} {'Std Dev':<15}")
-            print("-" * 110)
-            print(f"{'layer4':<20} {str(intermediate_outputs['layer4'].shape):<30} "
-                  f"{intermediate_outputs['layer4'].min().item():<15.6f} "
-                  f"{intermediate_outputs['layer4'].max().item():<15.6f} "
-                  f"{intermediate_outputs['layer4'].mean().item():<15.6f} "
-                  f"{intermediate_outputs['layer4'].std().item():<15.6f}")
+            # print("\nENCODER FINAL Image Stats:")
+            # print(f"{'Layer':<20} {'Shape':<30} {'Min':<15} {'Max':<15} {'Mean':<15} {'Std Dev':<15}")
+            # print("-" * 110)
+            # print(f"{'layer4':<20} {str(intermediate_outputs['layer4'].shape):<30} "
+            #       f"{intermediate_outputs['layer4'].min().item():<15.6f} "
+            #       f"{intermediate_outputs['layer4'].max().item():<15.6f} "
+            #       f"{intermediate_outputs['layer4'].mean().item():<15.6f} "
+            #       f"{intermediate_outputs['layer4'].std().item():<15.6f}")
 
             return intermediate_outputs, route_connection
         
@@ -471,16 +420,18 @@ def main_worker(gpu, ngpus_per_node, args):
             # print("Routes shapes : ", len(routes))
             out = self.decoder(enc_out['layer4'], routes)
 
+            # uncomment to see the decoder output image stats
 
-            print("\nDECODER OUTPUT RECONSTURCTED Image Stats:")
-            print(f"{'Layer':<20} {'Shape':<30} {'Min':<15} {'Max':<15} {'Mean':<15} {'Std Dev':<15}")
-            print("-" * 110)
-            print(f"{'layer4':<20} {str(out.shape):<30} "
-                  f"{out.min().item():<15.6f} "
-                  f"{out.max().item():<15.6f} "
-                  f"{out.mean().item():<15.6f} "
-                  f"{out.std().item():<15.6f}")
-            # print("Decoder output shape : ", out.shape)
+            # print("\nDECODER OUTPUT RECONSTURCTED Image Stats:")
+            # print(f"{'Layer':<20} {'Shape':<30} {'Min':<15} {'Max':<15} {'Mean':<15} {'Std Dev':<15}")
+            # print("-" * 110)
+            # print(f"{'layer4':<20} {str(out.shape):<30} "
+            #       f"{out.min().item():<15.6f} "
+            #       f"{out.max().item():<15.6f} "
+            #       f"{out.mean().item():<15.6f} "
+            #       f"{out.std().item():<15.6f}")
+            
+
             return enc_out['fc'], out
     # hem
     print("Creating Unet model")
@@ -488,13 +439,6 @@ def main_worker(gpu, ngpus_per_node, args):
     model = UNET(3, 512, 3, 5, 1)
     print("Unet model created")
     
-
-    # if args.pretrained:
-    #     print("=> using pre-trained model '{}'".format(args.arch))
-    #     model = models.__dict__[args.arch](pretrained=True)
-    # else:
-    #     print("=> creating model '{}'".format(args.arch))
-    #     model = models.__dict__[args.arch]()
 
     if not torch.cuda.is_available() and not torch.backends.mps.is_available():
         print("using CPU, this will be slow")
@@ -542,6 +486,8 @@ def main_worker(gpu, ngpus_per_node, args):
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
+    
+
     # define loss function (criterion), optimizer, and learning rate scheduler
     criterion = {}
     criterion['cls'] = nn.CrossEntropyLoss().to(device)
@@ -584,13 +530,16 @@ def main_worker(gpu, ngpus_per_node, args):
             print("=> no checkpoint found at '{}'".format(args.resume))
 
     # Data loading code
+
+
+
     if args.dummy:
         print("=> Dummy data is used!")
 
         # hem
         # dummy data with custom shape
         train_dataset = datasets.FakeData(
-            2600, (3, 224, 224), 1000, transforms.ToTensor()
+            256, (3, 224, 224), 1000, transforms.ToTensor()
         )
         val_dataset = datasets.FakeData(256, (3, 224, 224), 1000, transforms.ToTensor())
 
@@ -600,21 +549,35 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         traindir = os.path.join(args.data, "train")
         valdir = os.path.join(args.data, "val")
+        print("=> Using real data from '{}'".format(args.data))
+
+        # Define the transformation for light images
+
         normalize = transforms.Normalize(
             mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
         )
 
-        train_dataset = datasets.ImageFolder(
-            traindir,
-            transforms.Compose(
-                [
-                    transforms.RandomResizedCrop(224),
-                    transforms.RandomHorizontalFlip(),
-                    transforms.ToTensor(),
-                    normalize,
-                ]
-            ),
-        )
+        train_transforms = transforms.Compose([
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize,  # Normalization applied to light images
+        ])
+
+        # Create the dataset
+        train_dataset = DarkLightDataset(root=traindir, transform=train_transforms, gamma=2.2)
+
+        # train_dataset = datasets.ImageFolder(
+        #     traindir,
+        #     transforms.Compose(
+        #         [
+        #             transforms.RandomResizedCrop(224),
+        #             transforms.RandomHorizontalFlip(),
+        #             transforms.ToTensor(),
+        #             normalize,
+        #         ]
+        #     ),
+        # )
 
         val_dataset = datasets.ImageFolder(
             valdir,
@@ -642,6 +605,7 @@ def main_worker(gpu, ngpus_per_node, args):
         batch_size=args.batch_size,
         shuffle=(train_sampler is None),
         num_workers=args.workers,
+        # num_workers=0,
         pin_memory=True,
         sampler=train_sampler,
     )
@@ -658,22 +622,32 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.evaluate:
         validate(val_loader, model, criterion, args)
         return
+    
 
+    log_file = open("progress_log.txt", "w")
+
+    
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, device, args)
+        train(train_loader, model, criterion, optimizer, epoch, device, args, log_file)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        acc1 = validate(val_loader, model, criterion, args, log_file)
         # acc1 = 9
 
         scheduler.step()
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
+        if(is_best):
+            log_line = "Best model found at epoch : " + str(epoch) + " | | Best Accuracy : " + str(acc1)
+            print(log_line)
+            if log_file:
+                log_file.write(log_line + "\n")
+                log_file.flush()
         best_acc1 = max(acc1, best_acc1)
 
         if not args.multiprocessing_distributed or (
@@ -691,55 +665,61 @@ def main_worker(gpu, ngpus_per_node, args):
                 is_best,
             )
 
+    log_file.close()
 
-def train(train_loader, model, criterion, optimizer, epoch, device, args):
+def train(train_loader, model, criterion, optimizer, epoch, device, args, log_file=None):
     batch_time = AverageMeter("Time", ":6.3f")
     data_time = AverageMeter("Data", ":6.3f")
-    losses = AverageMeter("Loss", ":.4e")
+    loss_CLS = AverageMeter("Loss_CLS", ":.4e")
+    loss_MSE = AverageMeter("Loss_MSE", ":.4e")
     top1 = AverageMeter("Acc@1", ":6.2f")
     top5 = AverageMeter("Acc@5", ":6.2f")
     progress = ProgressMeter(
         len(train_loader),
-        [batch_time, data_time, losses, top1, top5],
+        [batch_time, data_time, loss_CLS, loss_MSE, top1, top5],
         prefix="Epoch: [{}]".format(epoch),
+        log_file = log_file,
     )
 
     # switch to train mode
     model.train()
 
     end = time.time()
-    for i, (images, target) in enumerate(train_loader):
+    for i, (dark_images, light_images, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
         # move data to the same device as model
-        images = images.to(device, non_blocking=True)
+        dark_images = dark_images.to(device, non_blocking=True)
+        light_images = light_images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
         # compute output
-        cls_output, gen_images = model(images)
+        cls_output, gen_images = model(dark_images)
 
         # cls_output = output_dict["fc"]
         loss = {}
         loss['cls'] = criterion['cls'](cls_output, target)
-        loss['mse'] = criterion['mse'](gen_images, images)
+        loss['mse'] = criterion['mse'](gen_images, light_images)
 
-        print("TRAIN_LOSS['cls'] : ", loss['cls'].item(), "  | | TRAIN_LOSS['mse'] : ", loss['mse'].item())
+        # print("TRAIN_LOSS['cls'] : ", loss['cls'].item(), "  | | TRAIN_LOSS['mse'] : ", loss['mse'].item())
+        # print("TRAIN_LOSS['cls'] : ", 'none', "  | | TRAIN_LOSS['mse'] : ", loss['mse'].item())
 
         # print("itr : ",i, " -> gen_images shape: ", gen_images.shape)
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(cls_output, target, topk=(1, 5))
         # acc1, acc5 = (float('nan'), float('nan'))
-        losses.update(loss['cls'].item(), images.size(0))  #TO DO : add MSE loss to the AverageMeter
-        top1.update(acc1[0], images.size(0))
-        top5.update(acc5[0], images.size(0))
+        loss_CLS.update(loss['cls'].item(), dark_images.size(0))  #TO DO : add MSE loss to the AverageMeter
+        loss_MSE.update(loss['mse'].item(), dark_images.size(0))  #TO DO : add MSE loss to the AverageMeter
+        top1.update(acc1[0], dark_images.size(0))
+        top5.update(acc5[0], dark_images.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
-        loss['cls'].backward()
+        # loss['cls'].backward()
         # loss['mse'].backward()
-        # sum(loss[k] for k in loss).backward()  # TO DO : add regularization parameter for balance between classification and reconstruction loss
+        sum(loss[k] for k in loss).backward()  # TO DO : add regularization parameter for balance between classification and reconstruction loss
         optimizer.step()
 
         # measure elapsed time
@@ -750,7 +730,7 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
             progress.display(i + 1)
 
 
-def validate(val_loader, model, criterion, args):
+def validate(val_loader, model, criterion, args, log_file=None):
 
     def run_validate(loader, base_progress=0):
         with torch.no_grad():
@@ -772,11 +752,13 @@ def validate(val_loader, model, criterion, args):
                 loss = {}
                 loss['cls'] = criterion['cls'](cls_output, target)
                 loss['mse'] = criterion['mse'](gen_images, images)
+                # print("EVAL_LOSS['cls'] : ", loss['cls'].item(), "  | | EVAL_LOSS['mse'] : ", loss['mse'].item())
 
                 # measure accuracy and record loss
                 acc1, acc5 = accuracy(cls_output, target, topk=(1, 5))
                 # acc1, acc5 = (float('nan'), float('nan'))
-                losses.update(loss['cls'].item(), images.size(0))
+                loss_CLS.update(loss['cls'].item(), images.size(0))
+                loss_MSE.update(loss['mse'].item(), images.size(0))
                 top1.update(acc1[0], images.size(0))
                 top5.update(acc5[0], images.size(0))
 
@@ -788,7 +770,8 @@ def validate(val_loader, model, criterion, args):
                     progress.display(i + 1)
 
     batch_time = AverageMeter("Time", ":6.3f", Summary.NONE)
-    losses = AverageMeter("Loss", ":.4e", Summary.NONE)
+    loss_CLS = AverageMeter("Loss_CLS", ":.4e", Summary.AVERAGE)
+    loss_MSE = AverageMeter("Loss_MSE", ":.4e", Summary.AVERAGE)
     top1 = AverageMeter("Acc@1", ":6.2f", Summary.AVERAGE)
     top5 = AverageMeter("Acc@5", ":6.2f", Summary.AVERAGE)
     progress = ProgressMeter(
@@ -797,8 +780,9 @@ def validate(val_loader, model, criterion, args):
             args.distributed
             and (len(val_loader.sampler) * args.world_size < len(val_loader.dataset))
         ),
-        [batch_time, losses, top1, top5],
+        [batch_time, loss_CLS, loss_MSE, top1, top5],
         prefix="Test: ",
+        log_file = log_file,
     )
 
     # switch to evaluate mode
@@ -897,20 +881,47 @@ class AverageMeter(object):
 
 
 class ProgressMeter(object):
-    def __init__(self, num_batches, meters, prefix=""):
+    def __init__(self, num_batches, meters, prefix="", log_file=None):
         self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
         self.meters = meters
         self.prefix = prefix
+        self.log_file = log_file
 
     def display(self, batch):
+        # entries = [self.prefix + self.batch_fmtstr.format(batch)]
+        # entries += [str(meter) for meter in self.meters]
+        # print("\t".join(entries))
+        # Generate the log string
         entries = [self.prefix + self.batch_fmtstr.format(batch)]
         entries += [str(meter) for meter in self.meters]
-        print("\t".join(entries))
+        log_line = "\t".join(entries)
+        
+        # Print to console
+        print(log_line)
+        
+        # Write to log file if available
+        if self.log_file:
+            self.log_file.write(log_line + "\n")
+            self.log_file.flush()
 
     def display_summary(self):
+        # entries = [" *"]
+        # entries += [meter.summary() for meter in self.meters]
+        # print(" ".join(entries))
+
+        # Generate the summary string
         entries = [" *"]
         entries += [meter.summary() for meter in self.meters]
-        print(" ".join(entries))
+        log_line = " ".join(entries)
+        
+        # Print to console
+        print(log_line)
+        
+        # Write to log file if available
+        if self.log_file:
+            self.log_file.write(log_line + "\n")
+            self.log_file.flush()
+
 
     def _get_batch_fmtstr(self, num_batches):
         num_digits = len(str(num_batches // 1))
