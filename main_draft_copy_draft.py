@@ -64,7 +64,7 @@ parser.add_argument(
 parser.add_argument(
     "-b",
     "--batch-size",
-    default=32,  # in the original code, the default batch size is 256
+    default=256,
     type=int,
     metavar="N",
     help="mini-batch size (default: 256), this is the total "
@@ -93,7 +93,7 @@ parser.add_argument(
 parser.add_argument(
     "-p",
     "--print-freq",
-    default=3,
+    default=10,
     type=int,
     metavar="N",
     help="print frequency (default: 10)",
@@ -219,54 +219,24 @@ def main_worker(gpu, ngpus_per_node, args):
             rank=args.rank,
         )
     # create model
-            # hem
-    class CNNBlock(nn.Module):
-        def __init__(self,
-                    in_channels,
-                    out_channels,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1):
-            super(CNNBlock, self).__init__()
+    # hem
 
-            self.seq_block = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False),
-                nn.BatchNorm2d(out_channels),
-                nn.LeakyReLU(negative_slope=0.3, inplace=True)  # Use LeakyReLU for negative_slope  # slope = 0.3 to match default value with keras
-            )
-
-        def forward(self, x):
-            x = self.seq_block(x)
-            return x
-        
-
-    class Encoder(torch.nn.Module):
+    class ResNetWithIntermediateOutputs(torch.nn.Module):
         def __init__(self, args):
-            super(Encoder, self).__init__()
+            super(ResNetWithIntermediateOutputs, self).__init__()
 
             # self.resnet = resnet18(pretrained=True)
 
             if args.pretrained:
                 print("=> using pre-trained model '{}'".format(args.arch))
                 self.resnet = models.__dict__[args.arch](pretrained=True)
-            else:                
-                print("=> creating encoder '{}'".format(args.arch))
+            else:
+                print("=> creating model '{}'".format(args.arch))
                 self.resnet = models.__dict__[args.arch]()
 
         def forward(self, x):
             intermediate_outputs = {}
             route_connection = []
-
-            print("\nENCODER INPUT Image Stats:")
-            print(f"{'Layer':<20} {'Shape':<30} {'Min':<15} {'Max':<15} {'Mean':<15} {'Std Dev':<15}")
-            print("-" * 110)
-            print(f"{'layer4':<20} {str(x.shape):<30} "
-                  f"{x.min().item():<15.6f} "
-                  f"{x.max().item():<15.6f} "
-                  f"{x.mean().item():<15.6f} "
-                  f"{x.std().item():<15.6f}")
-            
-            
             x = self.resnet.conv1(x)
             intermediate_outputs["conv1"] = x
             x = self.resnet.bn1(x)
@@ -282,6 +252,7 @@ def main_worker(gpu, ngpus_per_node, args):
             x = self.resnet.layer2(x)
             intermediate_outputs["layer2"] = x
             x = self.resnet.layer3(x)
+            
             intermediate_outputs["layer3"] = x
             x = self.resnet.layer4(x)
             intermediate_outputs["layer4"] = x
@@ -294,49 +265,13 @@ def main_worker(gpu, ngpus_per_node, args):
             intermediate_outputs["fc"] = x
 
 
-            route_connection.append(intermediate_outputs["layer0_relu"])
-            route_connection.append(intermediate_outputs["layer1"])
-            route_connection.append(intermediate_outputs["layer2"])
-            route_connection.append(intermediate_outputs["layer3"])
-            route_connection.append(intermediate_outputs["layer4"])
-
-            print("\nENCODER FINAL Image Stats:")
-            print(f"{'Layer':<20} {'Shape':<30} {'Min':<15} {'Max':<15} {'Mean':<15} {'Std Dev':<15}")
-            print("-" * 110)
-            print(f"{'layer4':<20} {str(intermediate_outputs['layer4'].shape):<30} "
-                  f"{intermediate_outputs['layer4'].min().item():<15.6f} "
-                  f"{intermediate_outputs['layer4'].max().item():<15.6f} "
-                  f"{intermediate_outputs['layer4'].mean().item():<15.6f} "
-                  f"{intermediate_outputs['layer4'].std().item():<15.6f}")
-
+            route_connection.append(intermediate_outputs["layer0_relu"], intermediate_outputs["layer1"], intermediate_outputs["layer2"], intermediate_outputs["layer3"], intermediate_outputs["layer4"])
             return intermediate_outputs, route_connection
-        
 
-    class UNET(nn.Module):
-        def __init__(self,
-                    in_channels=3,
-                    encoder_out_channels=512,
-                    exit_channels=3,
-                    downhill=5,
-                    padding=1
-                    ):
-            super(UNET, self).__init__()
-            self.encoder = Encoder(args)
-            # self.decoder = Decoder(encoder_out_channels, encoder_out_channels//2,
-            #                     exit_channels, padding=padding, uphill=downhill)
-
-        def forward(self, x):
-            enc_out, routes = self.encoder(x)
-            # print("Encoder output shapes : ", enc_out['layer4'].shape)
-            # print("Routes shapes : ", len(routes))
-            # out = self.decoder(enc_out['layer4'], routes)
-            # print("Decoder output shape : ", out.shape)
-            return enc_out['fc']
     # hem
-    print("Creating Unet model")
-    print("args.pretrained : ", args.pretrained)
-    model = UNET(3, 512, 3, 5, 1)
-    print("Unet model created")
+
+    model = ResNetWithIntermediateOutputs(args)
+
     # if args.pretrained:
     #     print("=> using pre-trained model '{}'".format(args.arch))
     #     model = models.__dict__[args.arch](pretrained=True)
@@ -432,12 +367,17 @@ def main_worker(gpu, ngpus_per_node, args):
     # Data loading code
     if args.dummy:
         print("=> Dummy data is used!")
+
+        # hem
+        # dummy data with custom shape
         train_dataset = datasets.FakeData(
-            1281167, (3, 224, 224), 1000, transforms.ToTensor()
+            2600, (3, 224, 224), 1000, transforms.ToTensor()
         )
-        val_dataset = datasets.FakeData(
-            50000, (3, 224, 224), 1000, transforms.ToTensor()
-        )
+        val_dataset = datasets.FakeData(256, (3, 224, 224), 1000, transforms.ToTensor())
+
+        # dummy data with default imagenet shape shape
+        # train_dataset = datasets.FakeData(1281167, (3, 224, 224), 1000, transforms.ToTensor())
+        # val_dataset = datasets.FakeData(50000, (3, 224, 224), 1000, transforms.ToTensor())
     else:
         traindir = os.path.join(args.data, "train")
         valdir = os.path.join(args.data, "val")
@@ -557,8 +497,13 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
         target = target.to(device, non_blocking=True)
 
         # compute output
-        output = model(images)
-        # print(f"Output - Min: {output.min().item()}, Max: {output.max().item()}, Shape: {output.shape}")
+        output_dict, routes = model(images)
+        print("Layer-wise output shapes:")
+        for layer_name, output in output_dict.items():
+            print(f"{layer_name}: {output.shape}")
+
+        output = output_dict["fc"]
+
         loss = criterion(output, target)
 
         # measure accuracy and record loss
@@ -596,7 +541,9 @@ def validate(val_loader, model, criterion, args):
                     target = target.cuda(args.gpu, non_blocking=True)
 
                 # compute output
-                output = model(images)
+                output_dict = model(images)
+                output = output_dict["fc"]
+
                 loss = criterion(output, target)
 
                 # measure accuracy and record loss

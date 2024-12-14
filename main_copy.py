@@ -250,7 +250,7 @@ def main_worker(gpu, ngpus_per_node, args):
             if args.pretrained:
                 print("=> using pre-trained model '{}'".format(args.arch))
                 self.resnet = models.__dict__[args.arch](pretrained=True)
-            else:
+            else:                
                 print("=> creating encoder '{}'".format(args.arch))
                 self.resnet = models.__dict__[args.arch]()
 
@@ -289,6 +289,99 @@ def main_worker(gpu, ngpus_per_node, args):
             route_connection.append(intermediate_outputs["layer2"])
             route_connection.append(intermediate_outputs["layer3"])
             route_connection.append(intermediate_outputs["layer4"])
+
+    # hem
+    class CNNBlock(nn.Module):
+        def __init__(self,
+                    in_channels,
+                    out_channels,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1):
+            super(CNNBlock, self).__init__()
+
+            self.seq_block = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False),
+                nn.BatchNorm2d(out_channels),
+                # nn.LeakyReLU(negative_slope=0.3, inplace=True)  # Use LeakyReLU for negative_slope  # slope = 0.3 to match default value with keras
+                nn.ReLU(inplace=True)  # ReLU to make decoder consistent with encoder
+            )
+
+        def forward(self, x):
+            x = self.seq_block(x)
+            return x
+        
+
+    class Encoder(torch.nn.Module):
+        def __init__(self, args):
+            super(Encoder, self).__init__()
+
+            # self.resnet = resnet18(pretrained=True)
+
+            if args.pretrained:
+                print("=> using pre-trained model '{}'".format(args.arch))
+                self.resnet = models.__dict__[args.arch](pretrained=True)
+            else:                
+                print("=> creating encoder '{}'".format(args.arch))
+                self.resnet = models.__dict__[args.arch]()
+
+        def forward(self, x):
+            intermediate_outputs = {}
+            route_connection = []
+
+
+            print("\nENCODER INPUT Image Stats:")
+            print(f"{'Layer':<20} {'Shape':<30} {'Min':<15} {'Max':<15} {'Mean':<15} {'Std Dev':<15}")
+            print("-" * 110)
+            print(f"{'layer4':<20} {str(x.shape):<30} "
+                  f"{x.min().item():<15.6f} "
+                  f"{x.max().item():<15.6f} "
+                  f"{x.mean().item():<15.6f} "
+                  f"{x.std().item():<15.6f}")
+            
+            x = self.resnet.conv1(x)
+            intermediate_outputs["conv1"] = x
+            x = self.resnet.bn1(x)
+            intermediate_outputs["bn1"] = x
+            x = self.resnet.relu(x)
+            intermediate_outputs["layer0_relu"] = x
+            x = self.resnet.maxpool(x)
+            intermediate_outputs["maxpool"] = x
+
+            # Layer-wise intermediate_outputs
+            x = self.resnet.layer1(x)
+            intermediate_outputs["layer1"] = x
+            x = self.resnet.layer2(x)
+            intermediate_outputs["layer2"] = x
+            x = self.resnet.layer3(x)
+            intermediate_outputs["layer3"] = x
+            x = self.resnet.layer4(x)
+            intermediate_outputs["layer4"] = x
+
+            # Add avgpool and fc for classification
+            x = self.resnet.avgpool(x)
+            x = torch.flatten(x, 1)  # Flatten before the fully connected layer
+            intermediate_outputs["avgpool"] = x
+            x = self.resnet.fc(x)
+            intermediate_outputs["fc"] = x
+
+
+            route_connection.append(intermediate_outputs["layer0_relu"])
+            route_connection.append(intermediate_outputs["layer1"])
+            route_connection.append(intermediate_outputs["layer2"])
+            route_connection.append(intermediate_outputs["layer3"])
+            route_connection.append(intermediate_outputs["layer4"])
+
+
+            print("\nENCODER FINAL Image Stats:")
+            print(f"{'Layer':<20} {'Shape':<30} {'Min':<15} {'Max':<15} {'Mean':<15} {'Std Dev':<15}")
+            print("-" * 110)
+            print(f"{'layer4':<20} {str(intermediate_outputs['layer4'].shape):<30} "
+                  f"{intermediate_outputs['layer4'].min().item():<15.6f} "
+                  f"{intermediate_outputs['layer4'].max().item():<15.6f} "
+                  f"{intermediate_outputs['layer4'].mean().item():<15.6f} "
+                  f"{intermediate_outputs['layer4'].std().item():<15.6f}")
+
             return intermediate_outputs, route_connection
         
     class Decoder(nn.Module):
@@ -377,10 +470,21 @@ def main_worker(gpu, ngpus_per_node, args):
             # print("Encoder output shapes : ", enc_out['layer4'].shape)
             # print("Routes shapes : ", len(routes))
             out = self.decoder(enc_out['layer4'], routes)
+
+
+            print("\nDECODER OUTPUT RECONSTURCTED Image Stats:")
+            print(f"{'Layer':<20} {'Shape':<30} {'Min':<15} {'Max':<15} {'Mean':<15} {'Std Dev':<15}")
+            print("-" * 110)
+            print(f"{'layer4':<20} {str(out.shape):<30} "
+                  f"{out.min().item():<15.6f} "
+                  f"{out.max().item():<15.6f} "
+                  f"{out.mean().item():<15.6f} "
+                  f"{out.std().item():<15.6f}")
             # print("Decoder output shape : ", out.shape)
             return enc_out['fc'], out
     # hem
     print("Creating Unet model")
+    print("args.pretrained : ", args.pretrained)
     model = UNET(3, 512, 3, 5, 1)
     print("Unet model created")
     
@@ -614,9 +718,6 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
 
         # compute output
         cls_output, gen_images = model(images)
-        # print("Layer-wise output shapes:")
-        # for layer_name, output in output_dict.items():
-        #     print(f"{layer_name}: {output.shape}")
 
         # cls_output = output_dict["fc"]
         loss = {}
@@ -636,8 +737,9 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
-        # loss.backward()
-        sum(loss[k] for k in loss).backward()  # TO DO : add regularization parameter for balance between classification and reconstruction loss
+        loss['cls'].backward()
+        # loss['mse'].backward()
+        # sum(loss[k] for k in loss).backward()  # TO DO : add regularization parameter for balance between classification and reconstruction loss
         optimizer.step()
 
         # measure elapsed time
