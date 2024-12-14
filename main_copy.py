@@ -64,7 +64,8 @@ parser.add_argument(
 parser.add_argument(
     "-b",
     "--batch-size",
-    default=256,
+    # default=256,
+    default=32,
     type=int,
     metavar="N",
     help="mini-batch size (default: 256), this is the total "
@@ -93,7 +94,7 @@ parser.add_argument(
 parser.add_argument(
     "-p",
     "--print-freq",
-    default=10,
+    default=1,
     type=int,
     metavar="N",
     help="print frequency (default: 10)",
@@ -220,10 +221,29 @@ def main_worker(gpu, ngpus_per_node, args):
         )
     # create model
     # hem
+    class CNNBlock(nn.Module):
+        def __init__(self,
+                    in_channels,
+                    out_channels,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1):
+            super(CNNBlock, self).__init__()
 
-    class ResNetWithIntermediateOutputs(torch.nn.Module):
+            self.seq_block = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.LeakyReLU(negative_slope=0.3, inplace=True)  # Use LeakyReLU for negative_slope  # slope = 0.3 to match default value with keras
+            )
+
+        def forward(self, x):
+            x = self.seq_block(x)
+            return x
+        
+
+    class Encoder(torch.nn.Module):
         def __init__(self, args):
-            super(ResNetWithIntermediateOutputs, self).__init__()
+            super(Encoder, self).__init__()
 
             # self.resnet = resnet18(pretrained=True)
 
@@ -231,7 +251,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 print("=> using pre-trained model '{}'".format(args.arch))
                 self.resnet = models.__dict__[args.arch](pretrained=True)
             else:
-                print("=> creating model '{}'".format(args.arch))
+                print("=> creating encoder '{}'".format(args.arch))
                 self.resnet = models.__dict__[args.arch]()
 
         def forward(self, x):
@@ -264,12 +284,106 @@ def main_worker(gpu, ngpus_per_node, args):
             intermediate_outputs["fc"] = x
 
 
-            route_connection.append(intermediate_outputs["layer0_relu"], intermediate_outputs["layer1"], intermediate_outputs["layer2"], intermediate_outputs["layer3"], intermediate_outputs["layer4"])
+            route_connection.append(intermediate_outputs["layer0_relu"])
+            route_connection.append(intermediate_outputs["layer1"])
+            route_connection.append(intermediate_outputs["layer2"])
+            route_connection.append(intermediate_outputs["layer3"])
+            route_connection.append(intermediate_outputs["layer4"])
             return intermediate_outputs, route_connection
+        
+    class Decoder(nn.Module):
+        """
+        Parameters:
+        in_channels (int): number of in_channels of the first ConvTranspose2d
+        out_channels (int): number of out_channels of the first ConvTranspose2d
+        padding (int): padding applied in each convolution
+        uphill (int): number times a ConvTranspose2d + CNNBlocks it's applied.
+        """
+        def __init__(self,
+                    in_channels,
+                    out_channels,
+                    exit_channels=3,
+                    padding=1,
+                    uphill=5):
+            super(Decoder, self).__init__()
+            self.exit_channels = exit_channels
+            self.upsample = nn.Upsample(scale_factor=(2, 2), mode='nearest')
+            self.layers = nn.ModuleList()
 
+            # add upsample and CNNBlock for first 3 layers of decoder
+            for i in range(uphill-2):
+
+                self.layers += [
+                    nn.Upsample(scale_factor=(2, 2), mode='nearest'),
+                    CNNBlock(in_channels, out_channels, kernel_size=3, stride=1, padding=padding),
+                    
+                ]
+                in_channels //= 2
+                out_channels //= 2
+
+            self.cnn_same_dim = CNNBlock(64, 64, kernel_size=3, stride=1, padding=1)
+            self.cnn_128_64 = CNNBlock(2*64, 64, kernel_size=3, stride=1, padding=1)
+
+            # cannot be a CNNBlock because it has ReLU incorpored
+            # cannot append nn.Sigmoid here because you should be later using
+            # BCELoss () which will trigger the amp error "are unsafe to autocast".
+            self.final_layer = nn.Conv2d(64, self.exit_channels, kernel_size=3, stride=1, padding=1)
+            
+            
+
+        def forward(self, x, routes_connection):
+            # pop the last element of the list since
+            # it's not used for concatenation
+            routes_connection.pop(-1)
+            for layer in self.layers:
+                if isinstance(layer, CNNBlock):
+                    x = layer(x)
+                    # concatenating tensors channel-wise
+                    x = torch.cat([x, routes_connection.pop(-1)], dim=1)
+                    x = layer(x)
+                else:
+                    x = layer(x)
+            
+            # print("Decoder output after 3 uphills : ", x.shape)
+            x = self.upsample(x) 
+            # print("Decoder output after 3 uphills upsampled : ", x.shape)
+            x = self.cnn_same_dim(x)
+            x = torch.cat([x, routes_connection.pop(-1)], dim=1)
+            x = self.cnn_128_64(x)
+
+            x = self.upsample(x)
+            x = self.cnn_same_dim(x)
+
+            x = self.final_layer(x)
+            return x
+
+            
+
+    class UNET(nn.Module):
+        def __init__(self,
+                    in_channels=3,
+                    encoder_out_channels=512,
+                    exit_channels=3,
+                    downhill=5,
+                    padding=1
+                    ):
+            super(UNET, self).__init__()
+            self.encoder = Encoder(args)
+            self.decoder = Decoder(encoder_out_channels, encoder_out_channels//2,
+                                exit_channels, padding=padding, uphill=downhill)
+
+        def forward(self, x):
+            enc_out, routes = self.encoder(x)
+            # print("Encoder output shapes : ", enc_out['layer4'].shape)
+            # print("Routes shapes : ", len(routes))
+            out = self.decoder(enc_out['layer4'], routes)
+            # print("Decoder output shape : ", out.shape)
+            return enc_out['fc'], out
     # hem
-
-    model = ResNetWithIntermediateOutputs(args)
+    print("Creating Unet model")
+    model = UNET(3, 512, 3, 5, 1)
+    print("Unet model created")
+    
 
     # if args.pretrained:
     #     print("=> using pre-trained model '{}'".format(args.arch))
@@ -325,7 +439,9 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         device = torch.device("cpu")
     # define loss function (criterion), optimizer, and learning rate scheduler
-    criterion = nn.CrossEntropyLoss().to(device)
+    criterion = {}
+    criterion['cls'] = nn.CrossEntropyLoss().to(device)
+    criterion['mse'] = nn.MSELoss().to(device)
 
     optimizer = torch.optim.SGD(
         model.parameters(),
@@ -448,6 +564,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
         # evaluate on validation set
         acc1 = validate(val_loader, model, criterion, args)
+        # acc1 = 9
 
         scheduler.step()
 
@@ -496,24 +613,31 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
         target = target.to(device, non_blocking=True)
 
         # compute output
-        output_dict, routes = model(images)
-        print("Layer-wise output shapes:")
-        for layer_name, output in output_dict.items():
-            print(f"{layer_name}: {output.shape}")
+        cls_output, gen_images = model(images)
+        # print("Layer-wise output shapes:")
+        # for layer_name, output in output_dict.items():
+        #     print(f"{layer_name}: {output.shape}")
 
-        output = output_dict["fc"]
+        # cls_output = output_dict["fc"]
+        loss = {}
+        loss['cls'] = criterion['cls'](cls_output, target)
+        loss['mse'] = criterion['mse'](gen_images, images)
 
-        loss = criterion(output, target)
+        print("TRAIN_LOSS['cls'] : ", loss['cls'].item(), "  | | TRAIN_LOSS['mse'] : ", loss['mse'].item())
+
+        # print("itr : ",i, " -> gen_images shape: ", gen_images.shape)
 
         # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), images.size(0))
+        acc1, acc5 = accuracy(cls_output, target, topk=(1, 5))
+        # acc1, acc5 = (float('nan'), float('nan'))
+        losses.update(loss['cls'].item(), images.size(0))  #TO DO : add MSE loss to the AverageMeter
         top1.update(acc1[0], images.size(0))
         top5.update(acc5[0], images.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
-        loss.backward()
+        # loss.backward()
+        sum(loss[k] for k in loss).backward()  # TO DO : add regularization parameter for balance between classification and reconstruction loss
         optimizer.step()
 
         # measure elapsed time
@@ -540,14 +664,17 @@ def validate(val_loader, model, criterion, args):
                     target = target.cuda(args.gpu, non_blocking=True)
 
                 # compute output
-                output_dict = model(images)
-                output = output_dict["fc"]
+                cls_output, gen_images = model(images)
 
-                loss = criterion(output, target)
+                # measure loss
+                loss = {}
+                loss['cls'] = criterion['cls'](cls_output, target)
+                loss['mse'] = criterion['mse'](gen_images, images)
 
                 # measure accuracy and record loss
-                acc1, acc5 = accuracy(output, target, topk=(1, 5))
-                losses.update(loss.item(), images.size(0))
+                acc1, acc5 = accuracy(cls_output, target, topk=(1, 5))
+                # acc1, acc5 = (float('nan'), float('nan'))
+                losses.update(loss['cls'].item(), images.size(0))
                 top1.update(acc1[0], images.size(0))
                 top5.update(acc5[0], images.size(0))
 
